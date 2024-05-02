@@ -1,0 +1,250 @@
+Configuring a loghost on RHEL8 using a rsyslog instance
+=======================================================
+
+Aim
+---
+To configure a loghost using a RHEL8 and the native rsyslog but keeping
+the loghost's logging from the remote logs.
+
+Outline 
+-------
+
+We will run a second rsyslogd instance with separate configuration and
+service file using a non standard port for the remote connections.
+
+Remote transport
+----------------
+
+Either udp or tcp may be used and with or without TLS. The simplest is
+udp.  The port on which the logging daemon listens is usually *514/udp*
+but can be be used if the host's rsyslogd daemon isn't using this port
+(rsyslogd normally configured not to listen on a network port.)
+
+Here we will use a non-reserved port *9514/udp* which removes the
+requirement for the rsyslogd process to run either as root or with
+**cap_net_bind_service** (ambient) capability.
+
+Process privilege
+-----------------
+
+The instance of rsyslogd (aka netlogd) will run under a dedicated
+unprivileged account netlog:netlog.
+
+Basic layout
+------------
+
+The configuration files are under
+
+	/opt/netlog
+
+and volatile files and logs under 
+
+	/var/opt/netlog.
+
+The configuration file which is a version of *rsyslog.conf* will be
+
+	/opt/netlog/etc/netlog.conf
+
+The binary is a symlink to /sbin/rsyslogd
+
+	/opt/netlog/sbin/netlogd --> /sbin/rsyslogd
+
+The log files are under 
+
+	/var/opt/netlog/log
+
+And the pid file under
+
+	/var/opt/netlog/run
+
+Ownership and permissions
+-------------------------
+
+The owner is mostly root:root.
+Where restricted read permissions are required by the netlogd process
+will be root:netlog (0640) and write permissions root:netlog (0660)
+with the containing directories root:netlog (2775.)
+
+Selinux labels
+--------------
+
+Basically follow those for rsyslog itself.
+For greater security could replicate same arrangement but distinct
+from rsyslog.
+
+object                            | label            | comment
+------                            | -----            | -------
+9514/udp                          | syslogd_port_t   | listening port
+/var/opt/netlog/log(/.*)?         | var_log_t        | log files
+/var/opt/netlog/run               | var_run_t        |
+/var/opt/netlog/run/netlog.pid    | syslogd_var_run_t|
+/opt/netlog/etc(/.*)?             | etc_t            |
+/opt/netlog/etc/logrotate.d(/.*)? | etc_t            |
+
+Steps
+-----
+
+1. Create user
+
+	groupadd -g 9514 netlog
+	useradd -u 9514 -g netlog netlog
+
+2. Create directories
+
+	mkdir -p /opt/netlog/{etc/logrotate.d,sbin} \
+		 /var/opt/netlog/{log,run}
+
+3. Set ownership and permissions
+
+	chown root:netlog /var/opt/netlog/{log,run}
+	chmod u=rwx,g=rwxs,o=rx /var/opt/netlog/{log,run}
+
+	chown root:root /opt/netlog/{etc/logrotate.d,sbin}
+	chmod u=rwx,g=rx,o=rx /opt/netlog/{etc/logrotate.d,sbin}
+
+4. Set selinux labels
+
+	semanage port -a -t syslogd_port_t -p udp 9514
+	semanage fcontext -a -t syslogd_var_run_t /var/opt/netlog/run/netlog.pid
+	semanage fcontext -a -t var_run_t /var/opt/netlog/run
+	semanage fcontext -a -t etc_t '/opt/netlog/etc/logrotate.d(/.*)?'
+	semanage fcontext -a -t etc_t '/opt/netlog/etc(/.*)?'
+
+5. Symlink rsylogd
+
+	ln -s /usr/sbin/rsyslogd /opt/netlog/sbin
+
+6. Create netlog.conf
+	Use /etc/rsyslog.conf as template but comment out systemd journal.
+
+#module(load="imjournal" # provides access to the systemd journal
+#       UsePid="system"  # PID nummber is retrieved as the ....
+#       StateFile="imjournal.state") # File to store the position in the journal
+
+and choose a transport and port
+
+	# Provides UDP syslog reception
+	module(load="imudp")
+	input(type="imudp" port="9514")
+
+A minimal netlog.conf logging everything to a single file
+
+	# @(#) /opt/netlog/etc/netlog.conf
+
+	module(load="imudp") # needs to be done just once
+	input(type="imudp" port="9514")
+
+	global(workDirectory="/var/opt/netlog")
+	module(load="builtin:omfile" Template="RSYSLOG_TraditionalFileFormat")
+
+	*.info  /var/opt/netlog/log/everything
+
+7. Create /etc/sysconfig/netlog 
+The systemd service file will sources this.
+
+	#
+	# @(#) /etc/sysconfig/netlog
+	#
+	SYSLOGD_OPTIONS="-f /opt/netlog/etc/netlog.conf -i /var/opt/netlog/run/netlog.pid"
+
+8. Create systemd service file
+Use /usr/lib/systemd/system/rsyslog.service as a
+template for /etc/systemd/system/netlog.service
+
+	[Unit]
+	Description=Network Logging Service
+	Wants=network.target network-online.target
+	After=network.target network-online.target
+	Documentation=man:rsyslogd(8)
+	Documentation=https://www.rsyslog.com/doc/
+
+	[Service]
+	Type=notify
+	User=netlog
+	Group=netlog
+	EnvironmentFile=-/etc/sysconfig/netlog
+	ExecStart=/opt/netlog/sbin/netlogd -n $SYSLOGD_OPTIONS
+	UMask=0066
+	StandardOutput=null
+	Restart=on-failure
+	RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+	RestrictNamespaces=net
+	NoNewPrivileges=yes
+	ProtectControlGroups=yes
+	ProtectHome=read-only
+	ProtectKernelModules=yes
+	ProtectKernelTunables=yes
+	RestrictSUIDSGID=yes
+	SystemCallArchitectures=native
+	SystemCallFilter=~@clock @debug @module @raw-io @reboot @swap @cpu-emulation @obsolete
+	LockPersonality=yes
+	MemoryDenyWriteExecute=yes
+
+	# Increase the default a bit in order to allow many simultaneous
+	# files to be monitored, we might need a lot of fds.
+	LimitNOFILE=16384
+
+	[Install]
+	WantedBy=multi-user.target
+
+9. Fix labels
+
+	restorecon -r -v /opt/netlog
+	restorecon -r -v /var/opt/netlog
+
+
+10. Open firewall
+Allow access from loghost clients to udp/9514.
+
+11. Start netlogd
+
+	systemctl enable netlog
+	systemctl start netlog
+
+
+Log rotation
+------------
+
+Using logrotate
+
+1.  Create logrotate conf file
+
+	# @(#) /opt/netlog/etc/logrotate.d/netlog
+	/var/opt/netlog/log/everything
+	{
+	    daily
+	    compress
+	    dateext
+	    rotate 60
+	    notifempty
+	    missingok
+	    sharedscripts
+	    su netlog netlog
+	    postrotate
+		/usr/bin/systemctl -s HUP kill netlog.service >/dev/null 2>&1 || true
+	    endscript
+	}
+
+2. Two choices here use the system logrotation
+viz
+Symlink this to /etc/logrotate.d
+
+	ln -s /opt/netlog/etc/logrotate.d/netlog /etc/logrotate.d
+
+or
+==
+Run logrotate from a cron job belonging to account netlog.
+
+	# @(#) crontab.netlog
+	#
+	13 1 * * * /usr/sbin/logrotate -s /var/opt/netlog/lib/logrotate.status /opt/netlog/logrotate.d/netlog
+
+Note: the state file /var/opt/netlog/lib/logrotate.status need to be labeled
+
+	mkdir /var/opt/netlog/lib
+	chown root:netlog /var/opt/netlog/lib
+	chmod u=rwx,g=rwxs,o=rx /var/opt/netlog/lib
+	semanage fcontext -t logrotate_var_lib_t:s0 '/var/opt/netlog/lib(/.*)?'
+	restorecon -r -v /var/opt/netlog/lib
+
+
